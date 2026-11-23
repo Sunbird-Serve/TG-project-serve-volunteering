@@ -13,6 +13,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * In-memory cache for user lookups by mobile and email.
@@ -24,7 +26,11 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 public class UserCacheService {
 
-    private final RcService rcService;
+    private final RcWindowedFetcher rcWindowedFetcher;
+
+    // Only one refresh runs at a time; a request made during a refresh triggers one more run afterwards
+    private final AtomicBoolean refreshing = new AtomicBoolean(false);
+    private final AtomicBoolean rerunRequested = new AtomicBoolean(false);
 
     // Mobile number -> User
     private volatile Map<String, User> mobileIndex = new ConcurrentHashMap<>();
@@ -32,10 +38,15 @@ public class UserCacheService {
     private volatile Map<String, User> emailIndex = new ConcurrentHashMap<>();
     // All users list (for status/agency filtering)
     private volatile List<User> allUsersCache = Collections.emptyList();
+    // True once at least one refresh from the registry has succeeded
+    private volatile boolean loaded = false;
+    // Emails of users created recently that a refresh may not contain yet (email -> created time)
+    private final Map<String, Long> pendingEmails = new ConcurrentHashMap<>();
+    private static final long PENDING_TTL_MS = 10 * 60 * 1000L;
 
     @Autowired
-    public UserCacheService(RcService rcService) {
-        this.rcService = rcService;
+    public UserCacheService(RcWindowedFetcher rcWindowedFetcher) {
+        this.rcWindowedFetcher = rcWindowedFetcher;
     }
 
     @PostConstruct
@@ -52,14 +63,30 @@ public class UserCacheService {
     }
 
     /**
-     * Refresh cache every 60 seconds.
-     * Configurable via application.properties: user.cache.refresh-interval-ms
+     * Refresh the cache on a schedule (user.cache.refresh-interval-ms, default 5 minutes).
+     * If a refresh is already running, this call does not start a second one; it asks the running one
+     * to go once more when it finishes, so a user created mid-refresh is still picked up.
      */
-    @Scheduled(fixedDelayString = "${user.cache.refresh-interval-ms:60000}", initialDelay = 10000)
+    @Scheduled(fixedDelayString = "${user.cache.refresh-interval-ms:300000}", initialDelay = 10000)
     public void refreshCache() {
+        if (!refreshing.compareAndSet(false, true)) {
+            rerunRequested.set(true);
+            return;
+        }
+        try {
+            do {
+                rerunRequested.set(false);
+                doRefresh();
+            } while (rerunRequested.get());
+        } finally {
+            refreshing.set(false);
+        }
+    }
+
+    private void doRefresh() {
         try {
             log.info("Refreshing user cache...");
-            List<User> users = rcService.getAllUsers();
+            List<User> users = rcWindowedFetcher.fetchAll("Users", User.class, User::getOsid);
 
             if (users == null || users.isEmpty()) {
                 log.warn("No users returned from registry, keeping existing cache");
@@ -87,6 +114,11 @@ public class UserCacheService {
             this.mobileIndex = newMobileIndex;
             this.emailIndex = newEmailIndex;
             this.allUsersCache = users;
+            this.loaded = true;
+
+            // Pending emails are no longer needed once the refresh contains them (or they are old enough)
+            long cutoff = System.currentTimeMillis() - PENDING_TTL_MS;
+            pendingEmails.entrySet().removeIf(e -> e.getValue() < cutoff || newEmailIndex.containsKey(e.getKey()));
 
             log.info("User cache refreshed: {} users, {} mobile entries, {} email entries",
                     users.size(), newMobileIndex.size(), newEmailIndex.size());
@@ -117,6 +149,49 @@ public class UserCacheService {
      */
     public List<User> getAllUsers() {
         return allUsersCache;
+    }
+
+    /**
+     * True once the cache has been filled from the registry at least once.
+     * Duplicate checks are only trustworthy after that.
+     */
+    public boolean isLoaded() {
+        return loaded;
+    }
+
+    /**
+     * True if a user with this email is in the cache, or was created recently and
+     * has not appeared in a refresh yet. Case-insensitive.
+     */
+    public boolean emailExists(String email) {
+        if (email == null) return false;
+        String key = email.trim().toLowerCase();
+        return emailIndex.containsKey(key) || pendingEmails.containsKey(key);
+    }
+
+    /**
+     * Remember an email immediately after a user is created, so a second request
+     * for the same email is rejected before the next refresh picks the user up.
+     */
+    public void registerEmail(String email) {
+        if (email == null || email.isBlank()) return;
+        pendingEmails.put(email.trim().toLowerCase(), System.currentTimeMillis());
+    }
+
+    /**
+     * Remove a user from the cache right away (used after delete) so the email can be reused.
+     */
+    public void evict(String osid, String email) {
+        if (osid != null) {
+            emailIndex.values().removeIf(u -> osid.equals(u.getOsid()));
+            mobileIndex.values().removeIf(u -> osid.equals(u.getOsid()));
+            this.allUsersCache = allUsersCache.stream()
+                    .filter(u -> !osid.equals(u.getOsid()))
+                    .collect(Collectors.toList());
+        }
+        if (email != null) {
+            pendingEmails.remove(email.trim().toLowerCase());
+        }
     }
 
     /**

@@ -107,6 +107,7 @@ class UserManagementServiceTest {
         // Given
         UserRequest userRequest = createValidUserRequest();
         RcUserResponse expectedResponse = new RcUserResponse();
+        when(userCacheService.isLoaded()).thenReturn(true);
         when(rcService.createUser(userRequest)).thenReturn(ResponseEntity.status(HttpStatus.CREATED).body(expectedResponse));
         doNothing().when(userCacheService).invalidate();
 
@@ -127,6 +128,7 @@ class UserManagementServiceTest {
         String userId = "test-user-id";
         UserRequest userRequest = createValidUserRequest();
         RcUserResponse expectedResponse = new RcUserResponse();
+        when(userCacheService.isLoaded()).thenReturn(true);
         when(rcService.updateUser(userRequest, userId)).thenReturn(ResponseEntity.ok(expectedResponse));
 
         // When
@@ -143,16 +145,16 @@ class UserManagementServiceTest {
     void getAllUsers_ShouldReturnAllUsers() {
         // Given
         List<User> expectedUsers = Arrays.asList(createTestUser(), createTestUser());
-        when(rcService.getUsers()).thenReturn(expectedUsers);
+        when(userCacheService.getAllUsers()).thenReturn(Arrays.asList(createTestUser(), createInactiveUser(), createTestUser()));
 
         // When
         ResponseEntity<List<User>> response = userManagementService.getAllUsers(headers);
 
-        // Then
+        // Then: only Active users from the cache
         assertNotNull(response);
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertEquals(expectedUsers, response.getBody());
-        verify(rcService).getUsers();
+        verify(userCacheService).getAllUsers();
     }
 
     private User createTestUser() {
